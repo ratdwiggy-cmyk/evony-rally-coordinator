@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0B0D12" />
+    <meta
+      name="description"
+      content="Live alliance status board for Evony — see who's available, scouting, looking for a boss, or able to lead, at a glance."
+    />
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <!--
+      No manual <link rel="manifest"> here: vite-plugin-pwa (see vite.config.ts)
+      injects this tag itself at build time with the correct, base-path-aware
+      href (`/evony-rally-coordinator/manifest.webmanifest` on GitHub Pages).
+      A hand-written copy would either duplicate that tag or have Vite treat it
+      as a separate asset reference and mis-resolve it under the repo subpath.
+    -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <title>Evony Rally Coordinator</title>
+  </head>
+  <body class="bg-ink-950 text-ash-50 font-sans antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,158 @@
+// -----------------------------------------------------------------------------
+// Firestore Security Rules — ADR-011 (Spark-compatible alliance join system),
+// superseding the custom-claim design PROJECT_SPECIFICATION.md Section 13 and
+// this file originally described (ADR-004). There is no Cloud Function and no
+// Admin SDK anywhere in this app any more, so there is no ID token claim to
+// check — every rule below establishes alliance membership by reading the
+// caller's own `users/{uid}` profile document instead. This is the actual
+// security boundary; client-side validation in `firebase/firestore.ts` is a
+// UX nicety only and must never be relied on here.
+//
+// Collections (unchanged from the original schema except for the two
+// additions this join system requires — see docs/DATABASE_SETUP.md Section 2
+// and ARCHITECTURE_DECISIONS.md ADR-011):
+//   alliances/{allianceId}                    — existing, unchanged shape
+//   alliances/{allianceId}/players/{uid}       — existing, unchanged shape
+//   users/{uid}                                — NEW: membership record, replaces the token claim
+//   joinCodes/{sha256(normalizedCode)}         — NEW: join-code lookup, replaces server-side verification
+// -----------------------------------------------------------------------------
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Membership helpers ---------------------------------------------------
+    // Membership now lives in Firestore itself (the user's own profile
+    // document) rather than in a signed token, so establishing it requires a
+    // same-request `get()` against `users/{request.auth.uid}`. This costs one
+    // extra document read per rule evaluation (billed like any other read),
+    // which is why every rule below that needs membership calls this once via
+    // a function rather than re-reading it inline.
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasAllianceMembership(allianceId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && myProfile().allianceId == allianceId;
+    }
+
+    function isValidStatus(status) {
+      return status in ['available', 'maybe', 'unavailable'];
+    }
+
+    function isValidPlayerWrite(data) {
+      return isValidStatus(data.status)
+        && data.ign is string && data.ign.size() > 0 && data.ign.size() <= 32
+        && (data.note == null || (data.note is string && data.note.size() <= 140))
+        && data.lookingFor is list && data.lookingFor.size() <= 20
+        && data.canLead is list && data.canLead.size() <= 20
+        && data.scouting is bool
+        && data.capability is map
+        // lastUpdated must be server-set via serverTimestamp(), never a
+        // client-supplied value.
+        && data.lastUpdated == request.time;
+    }
+
+    // A profile write is accepted only if it points at a real alliance and
+    // reports that alliance's actual name — this stops a caller from writing
+    // garbage or a spoofed display name into their own profile. It does NOT,
+    // and structurally cannot, verify that the caller actually knew the
+    // correct join code: on the Spark plan there is no server-side secret
+    // comparison, so the join code is a shared-secret gate enforced by the
+    // client UI (matching how alliances already share it in Discord), not a
+    // cryptographic access boundary enforced here. See docs/DATABASE_SETUP.md
+    // Section 6 for the full explanation of this tradeoff. What rules DO
+    // still guarantee, unconditionally: nobody can write to any profile but
+    // their own, and nobody can read any profile but their own.
+    function isValidProfileWrite(data) {
+      return data.allianceId is string && data.allianceId.size() > 0
+        && exists(/databases/$(database)/documents/alliances/$(data.allianceId))
+        && data.allianceName is string && data.allianceName.size() > 0
+        && data.allianceName
+             == get(/databases/$(database)/documents/alliances/$(data.allianceId)).data.name
+        // joinedAt must be server-set via serverTimestamp(), same rationale
+        // as lastUpdated/createdAt on player documents below.
+        && data.joinedAt == request.time;
+    }
+
+    // --- users/{uid} — membership record (ADR-011) -----------------------------
+    match /users/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list: if false; // never enumerate other users' membership
+
+      allow create: if signedIn() && request.auth.uid == uid
+        && isValidProfileWrite(request.resource.data);
+
+      // Re-joining (e.g. switching alliances with a new code) overwrites the
+      // whole document the same way create does — there's no partial-update
+      // path that could leave allianceId and allianceName pointing at
+      // different alliances.
+      allow update: if signedIn() && request.auth.uid == uid
+        && isValidProfileWrite(request.resource.data);
+
+      allow delete: if false; // no "leave alliance" path in this phase's scope
+    }
+
+    // --- joinCodes/{hash} — join-code lookup (ADR-011) --------------------------
+    // Document ID is the SHA-256 hex digest of the normalized plaintext code
+    // (see utils/joinCode.ts) — the plaintext itself is never stored. `get`
+    // is allowed for any signed-in (including anonymous) session so the
+    // client can resolve a code it was told out-of-band (e.g. in Discord);
+    // `list` stays denied so the collection can never be enumerated/brute-
+    // forced by iterating documents — only a `get` on a hash you already
+    // computed from a code you already know will ever succeed.
+    match /joinCodes/{hash} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow write: if false; // console/CLI only, same as alliance documents below
+    }
+
+    // --- alliances/{allianceId} — existing collection, unchanged shape ---------
+    match /alliances/{allianceId} {
+      // Reads are now gated on the caller's own profile pointing at this
+      // alliance, instead of a token claim equal to it.
+      allow get: if hasAllianceMembership(allianceId);
+      allow list: if false; // never enumerate alliances client-side
+
+      // Still entirely read-only from any client session — creating or
+      // rotating an alliance (and its joinCodes entry) is a console/CLI-only
+      // action, same as before ADR-011. See docs/DATABASE_SETUP.md Section 2.
+      allow write: if false;
+
+      match /players/{playerId} {
+        // Reads scoped to your own alliance.
+        allow read: if hasAllianceMembership(allianceId);
+
+        // Writes only to your own document, only within your own alliance,
+        // and creation is pinned to your own uid so no player can ever
+        // create or overwrite another player's record.
+        allow create: if hasAllianceMembership(allianceId)
+          && request.auth.uid == playerId
+          && playerId == request.resource.id
+          && isValidPlayerWrite(request.resource.data)
+          && request.resource.data.createdAt == request.time;
+
+        allow update: if hasAllianceMembership(allianceId)
+          && request.auth.uid == playerId
+          // createdAt is immutable once set — only lastUpdated changes on
+          // subsequent writes.
+          && request.resource.data.createdAt == resource.data.createdAt
+          && isValidPlayerWrite(request.resource.data);
+
+        allow delete: if false; // no delete path in this phase's scope
+      }
+    }
+
+    // Default deny for anything not explicitly matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
